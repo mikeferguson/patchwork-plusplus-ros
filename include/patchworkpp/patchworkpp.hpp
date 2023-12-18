@@ -19,8 +19,10 @@
 #include <queue>
 #include <mutex>
 #include <patchworkpp/utils.hpp>
-#include "rclcpp_components/register_node_macro.hpp"
-#include "rcl_interfaces/msg/set_parameters_result.hpp"
+#include <pcl_ros/transforms.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #define MARKER_Z_VALUE -2.2
 #define UPRIGHT_ENOUGH 0.55
@@ -62,10 +64,33 @@ public:
     typedef std::vector<pcl::PointCloud<PointT>> Ring;
     typedef std::vector<Ring> Zone;
 
-    PatchWorkpp(const rclcpp::NodeOptions &options)
-        : Node("patchworkpp", options) {
+    PatchWorkpp(const rclcpp::NodeOptions &options) : Node("patchworkpp", options) {
         // Init ROS related
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Inititalizing PatchWork++...");
+
+        // Setup parameters
+        sensor_height_ = this->declare_parameter<double>("sensor_height", 1.723);
+        num_iter_ = this->declare_parameter<int>("num_iter", 3);
+        num_lpr_ = this->declare_parameter<int>("num_lpr", 20);
+        num_min_pts_ = this->declare_parameter<int>("num_min_pts", 10);
+
+        th_seeds_ = this->declare_parameter<double>("th_seeds", 0.4);
+        th_dist_ = this->declare_parameter<double>("th_dist", 0.3);
+        th_seeds_v_ = this->declare_parameter<double>("th_seeds_v", 0.4);
+        th_dist_v_ = this->declare_parameter<double>("th_dist_v", 0.3);
+        max_range_ = this->declare_parameter<double>("max_r", 30.0);
+        min_range_ = this->declare_parameter<double>("min_r", 0.1);
+        uprightness_thr_ = this->declare_parameter<double>("uprightness_thr", 0.5);
+        adaptive_seed_selection_margin_ = this->declare_parameter<double>("adaptive_seed_selection_margin", -1.1);
+        RNR_ver_angle_thr_ = this->declare_parameter<double>("RNR_ver_angle_thr", -15.0);
+        RNR_intensity_thr_ = this->declare_parameter<double>("RNR_intensity_thr", 0.2);
+        max_flatness_storage_ = this->declare_parameter<int>("max_flatness_storage", 1000);
+        max_elevation_storage_ = this->declare_parameter<int>("max_elevation_storage", 1000);
+        enable_RNR_ = this->declare_parameter<bool>("enable_RNR", true);
+        enable_RVPF_ = this->declare_parameter<bool>("enable_RVPF", true);
+        enable_TGR_ = this->declare_parameter<bool>("enable_TGR", true);
+        verbose_ = this->declare_parameter<bool>("verbose", false);
+
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Sensor Height: %f", sensor_height_);
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Num of Iteration: %d", num_iter_);
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Num of LPR: %d", num_lpr_);
@@ -76,9 +101,17 @@ public:
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Min. range:: %f", min_range_);
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Normal vector threshold: %f", uprightness_thr_);
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "adaptive_seed_selection_margin: %f", adaptive_seed_selection_margin_);
-        RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "RNR_ver_angle_thr: %f", RNR_ver_angle_thr_);
+
+        target_frame_ = this->declare_parameter<std::string>("target_frame", "");
+        if (!target_frame_.empty())
+        {
+            RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Transforming to %s", target_frame_.c_str());
+            tf2_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+            tf2_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf2_buffer_);
+        }
 
         // CZM denotes 'Concentric Zone Model'. Please refer to our paper
+        num_zones_ = 4;
         num_sectors_each_zone_ = std::vector<long>{8, 8, 8, 8};
         new_num_sectors_each_zone_   = std::vector<long>{8, 8, 8, 8}; 
         num_rings_each_zone_   = std::vector<long>{8, 8, 8, 8};
@@ -118,15 +151,16 @@ public:
         regionwise_ground_.reserve(NUM_HEURISTIC_MAX_PTS_IN_PATCH);
         regionwise_nonground_.reserve(NUM_HEURISTIC_MAX_PTS_IN_PATCH);
 
-        pub_revert_pc = Node::create_publisher<sensor_msgs::msg::PointCloud2>("plane", 100);
-        pub_reject_pc = Node::create_publisher<sensor_msgs::msg::PointCloud2>("plane", 100);
-        pub_normal = Node::create_publisher<sensor_msgs::msg::PointCloud2>("plane", 100);
-        pub_noise = Node::create_publisher<sensor_msgs::msg::PointCloud2>("plane", 100);
-        pub_vertical = Node::create_publisher<sensor_msgs::msg::PointCloud2>("plane", 100);
+        pub_revert_pc_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("revert_pc", 1);
+        pub_reject_pc_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("reject_pc", 1);
+        pub_normal_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("normals", 1);
+        pub_noise_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("noise", 1);
+        pub_vertical_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("vertical", 1);
 
         min_range_z2_ = (7 * min_range_ + max_range_) / 8.0;
         min_range_z3_ = (3 * min_range_ + max_range_) / 4.0;
         min_range_z4_ = (min_range_ + max_range_) / 2.0;
+
         min_ranges_ = {min_range_, min_range_z2_, min_range_z3_, min_range_z4_};
         ring_sizes_ = {(min_range_z2_ - min_range_) / num_rings_each_zone_.at(0),
                       (min_range_z3_ - min_range_z2_) / num_rings_each_zone_.at(1),
@@ -143,47 +177,41 @@ public:
             ConcentricZoneModel_.push_back(z);
         }
 
-        cloud_topic = "/kitti/point_cloud";
-        pub_cloud = Node::create_publisher<sensor_msgs::msg::PointCloud2>("cloud", 100);
-        pub_ground = Node::create_publisher<sensor_msgs::msg::PointCloud2>("ground", 100);
-        pub_non_ground = Node::create_publisher<sensor_msgs::msg::PointCloud2>("nonground", 100);
-        sub_cloud = Node::create_subscription<sensor_msgs::msg::PointCloud2>(cloud_topic, 100, std::bind(&PatchWorkpp<PointT>::callbackCloud, this, std::placeholders::_1));    
-        callback_handle_ = this->add_on_set_parameters_callback(std::bind(&PatchWorkpp<PointT>::parametersCallback, this, std::placeholders::_1));
-
-    };
+        pub_ground_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("ground", 1);
+        pub_non_ground_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("nonground", 1);
+        sub_cloud_ = Node::create_subscription<sensor_msgs::msg::PointCloud2>("cloud", 1, std::bind(&PatchWorkpp<PointT>::callbackCloud, this, std::placeholders::_1));
+    }
 
     void estimate_ground(pcl::PointCloud<PointT> cloud_in, pcl::PointCloud<PointT> &cloud_ground, pcl::PointCloud<PointT> &cloud_nonground, double &time_taken);
 
-
 private:
-
     // Every private member variable is written with the undescore("_") in its end.
     std::recursive_mutex mutex_;
 
-    int num_iter_ =  3;
-    int num_lpr_ = 20;
-    int num_min_pts_ = 15 ;
-    int num_zones_ = 4;
+    int num_iter_;
+    int num_lpr_;
+    int num_min_pts_;
+    int num_zones_;
     int num_rings_of_interest_;
-    std::string cloud_topic = "/kitti/point_cloud";
-    double sensor_height_ =  1.2;
-    double th_seeds_ = 0.3;
-    double th_dist_ = 0.4;
-    double th_seeds_v_ = 0.25;
-    double th_dist_v_ = 0.1;
-    double max_range_ = 80.0;
-    double min_range_ = 0.0;
-    double uprightness_thr_ =  0.707;
+
+    double sensor_height_;
+    double th_seeds_;
+    double th_dist_;
+    double th_seeds_v_;
+    double th_dist_v_;
+    double max_range_;
+    double min_range_;
+    double uprightness_thr_;
     double adaptive_seed_selection_margin_;
-    double min_range_z2_ = 12.3625; // 12.3625
-    double min_range_z3_ = 22.025; // 22.025
-    double min_range_z4_ = 41.35; // 41.35
-    double RNR_ver_angle_thr_ = -20.0;
-    double RNR_intensity_thr_ = 0.2;
-    bool verbose_  = false;
-    bool enable_RNR_ = true;
-    bool enable_RVPF_= true;
-    bool enable_TGR_= true;
+    double min_range_z2_;
+    double min_range_z3_;
+    double min_range_z4_;
+    double RNR_ver_angle_thr_;
+    double RNR_intensity_thr_;
+    bool verbose_;
+    bool enable_RNR_;
+    bool enable_RVPF_;
+    bool enable_TGR_;
 
     int max_flatness_storage_, max_elevation_storage_;
     std::vector<double> update_flatness_[4];
@@ -213,10 +241,13 @@ private:
     queue<int> noise_idxs_;
     vector<Zone> ConcentricZoneModel_;
 
+    std::string target_frame_;
+    std::shared_ptr<tf2_ros::Buffer> tf2_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf2_listener_;
+
     // ros::Publisher PlaneViz, 
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_revert_pc, pub_reject_pc, pub_normal, pub_noise, pub_vertical, pub_cloud, pub_ground, pub_non_ground;
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_cloud;
-    OnSetParametersCallbackHandle::SharedPtr callback_handle_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_revert_pc_, pub_reject_pc_, pub_normal_, pub_noise_, pub_vertical_, pub_ground_, pub_non_ground_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_cloud_;
     pcl::PointCloud<PointT> revert_pc_, reject_pc_, noise_pc_, vertical_pc_;
     pcl::PointCloud<PointT> ground_pc_;
     pcl::PointCloud<pcl::PointXYZINormal> normals_;
@@ -250,8 +281,6 @@ private:
     void callbackCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud_msg);
 
     /* ROS Callbacks Functions */
-    rcl_interfaces::msg::SetParametersResult parametersCallback(
-        const std::vector<rclcpp::Parameter> &parameters);
     sensor_msgs::msg::PointCloud2 cloud2msg(pcl::PointCloud<PointT> cloud, const rclcpp::Time& stamp, std::string frame_id = "map");
 };
 
@@ -399,39 +428,6 @@ void PatchWorkpp<PointT>::reflected_noise_removal(pcl::PointCloud<PointT> &cloud
     }
 
     if (verbose_) cout << "[ RNR ] Num of noises : " << noise_pc_.points.size() << endl;
-}
-
-template<typename PointT> inline
-rcl_interfaces::msg::SetParametersResult PatchWorkpp<PointT>::parametersCallback(
-    const std::vector<rclcpp::Parameter> &parameters)
-{
-    rcl_interfaces::msg::SetParametersResult result;
-    result.successful = true;
-    result.reason = "success";
-    auto new_num_zones_ = 4;
-    auto new_cloud_topic = "/kitti/point_cloud";
-    if (new_cloud_topic != cloud_topic) {
-        cloud_topic = new_cloud_topic;
-        sub_cloud = Node::create_subscription<sensor_msgs::msg::PointCloud2>(cloud_topic, 100, std::bind(&PatchWorkpp<PointT>::callbackCloud, this, std::placeholders::_1));    
-    }
-
-    if (new_num_zones_ != 4 || new_num_sectors_each_zone_.size() != new_num_rings_each_zone_.size()) {
-        result.successful = false;
-        result.reason = "Some parameters are wrong! Check the num_zones and num_rings/sectors_each_zone";
-    } else {
-        num_zones_ = new_num_zones_;
-        num_sectors_each_zone_ = new_num_rings_each_zone_;
-        num_rings_each_zone_ = new_num_rings_each_zone_;
-    }
-    if (new_elevation_thr_.size() != new_flatness_thr_.size()) {
-        result.successful = false;
-        result.reason = "Some parameters are wrong! Check the elevation/flatness_thresholds";
-    } else {
-        elevation_thr_ = new_elevation_thr_;
-        flatness_thr_ = new_flatness_thr_;
-    }
-
-    return result;
 }
 
 /*
@@ -621,27 +617,27 @@ void PatchWorkpp<PointT>::estimate_ground(
         pcl::toROSMsg(revert_pc_, cloud_ROS);
         cloud_ROS.header.stamp = rclcpp::Clock{RCL_STEADY_TIME}.now();
         cloud_ROS.header.frame_id = cloud_in.header.frame_id;
-        pub_revert_pc->publish(cloud_ROS);
+        pub_revert_pc_->publish(cloud_ROS);
 
         pcl::toROSMsg(reject_pc_, cloud_ROS);
         cloud_ROS.header.stamp = rclcpp::Clock{RCL_STEADY_TIME}.now();
         cloud_ROS.header.frame_id = cloud_in.header.frame_id;
-        pub_reject_pc->publish(cloud_ROS);
+        pub_reject_pc_->publish(cloud_ROS);
 
         pcl::toROSMsg(normals_, cloud_ROS);
         cloud_ROS.header.stamp = rclcpp::Clock{RCL_STEADY_TIME}.now();
         cloud_ROS.header.frame_id = cloud_in.header.frame_id;
-        pub_normal->publish(cloud_ROS);
+        pub_normal_->publish(cloud_ROS);
 
         pcl::toROSMsg(noise_pc_, cloud_ROS);
         cloud_ROS.header.stamp = rclcpp::Clock{RCL_STEADY_TIME}.now();
         cloud_ROS.header.frame_id = cloud_in.header.frame_id;
-        pub_noise->publish(cloud_ROS);
+        pub_noise_->publish(cloud_ROS);
 
         pcl::toROSMsg(vertical_pc_, cloud_ROS);
         cloud_ROS.header.stamp = rclcpp::Clock{RCL_STEADY_TIME}.now();
         cloud_ROS.header.frame_id = cloud_in.header.frame_id;
-        pub_vertical->publish(cloud_ROS);
+        pub_vertical_->publish(cloud_ROS);
     }
 
     revert_pc_.clear();
@@ -905,15 +901,27 @@ void PatchWorkpp<PointT>::callbackCloud(const sensor_msgs::msg::PointCloud2::Con
     pcl::PointCloud<PointT> pc_non_ground;
 
     pcl::fromROSMsg(*cloud_msg, pc_curr);
+    std::string output_frame = cloud_msg->header.frame_id;
+
+    // Optionally transform cloud to target_frame_
+    if (tf2_buffer_)
+    {
+        if (!pcl_ros::transformPointCloud(target_frame_, pc_curr, pc_curr, *tf2_buffer_))
+        {
+            RCLCPP_ERROR(rclcpp::get_logger("patchworkpp"), "Could not transform %s to %s frame.",
+                         cloud_msg->header.frame_id.c_str(), target_frame_.c_str());
+            return;
+        }
+        output_frame = target_frame_;
+    }
 
     estimate_ground(pc_curr, pc_ground, pc_non_ground, time_taken);
 
     RCLCPP_INFO_STREAM(rclcpp::get_logger("patchworkpp"), "\033[1;32m" << "Input PointCloud: " << pc_curr.size() << " -> Ground: " << pc_ground.size() <<  "/ NonGround: " << pc_non_ground.size()
          << " (running_time: " << time_taken << " sec)" << "\033[0m");
 
-    pub_cloud->publish(cloud2msg(pc_curr, cloud_msg->header.stamp, cloud_msg->header.frame_id));
-    pub_ground->publish(cloud2msg(pc_ground, cloud_msg->header.stamp, cloud_msg->header.frame_id));
-    pub_non_ground->publish(cloud2msg(pc_non_ground, cloud_msg->header.stamp, cloud_msg->header.frame_id));
+    pub_ground_->publish(cloud2msg(pc_ground, cloud_msg->header.stamp, output_frame));
+    pub_non_ground_->publish(cloud2msg(pc_non_ground, cloud_msg->header.stamp, output_frame));
 }
 
 template<typename PointT>

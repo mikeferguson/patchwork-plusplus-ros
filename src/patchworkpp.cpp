@@ -8,6 +8,7 @@
 #include "patchworkpp/patchworkpp.hpp"
 #include <signal.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <rclcpp_components/register_node_macro.hpp>
 
 
 using PointType = pcl::PointXYZI;
