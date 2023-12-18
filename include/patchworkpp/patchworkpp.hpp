@@ -112,7 +112,7 @@ public:
 
         // CZM denotes 'Concentric Zone Model'. Please refer to our paper
         num_zones_ = 4;
-        num_sectors_each_zone_ = std::vector<long>{16, 24, 32, 16};
+        num_sectors_each_zone_ = std::vector<long>{16, 16, 24, 16};
         num_rings_each_zone_   = std::vector<long>{2, 2, 4, 2};
         elevation_thr_ = std::vector<double>{0.0, 0.0, 0.0, 0.0};
         flatness_thr_  = std::vector<double>{0.0, 0.0, 0.0, 0.0};
@@ -149,9 +149,12 @@ public:
 
         pub_revert_pc_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("revert_pc", 1);
         pub_reject_pc_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("reject_pc", 1);
-        pub_normal_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("normals", 1);
         pub_noise_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("noise", 1);
         pub_vertical_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("vertical", 1);
+        pub_minimum_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("minimum", 1);
+        pub_threshold_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("threshold", 1);
+        pub_upright_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("upright", 1);
+        pub_heading_ = Node::create_publisher<sensor_msgs::msg::PointCloud2>("heading", 1);
 
         min_range_z2_ = (7 * min_range_ + max_range_) / 8.0;
         min_range_z3_ = (3 * min_range_ + max_range_) / 4.0;
@@ -237,12 +240,26 @@ private:
     std::shared_ptr<tf2_ros::Buffer> tf2_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf2_listener_;
 
-    // ros::Publisher PlaneViz, 
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_revert_pc_, pub_reject_pc_, pub_normal_, pub_noise_, pub_vertical_, pub_ground_, pub_non_ground_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_revert_pc_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_reject_pc_;
+    // Determined to be nonground by reflected noise removal
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_noise_;
+    // Determined to be nonground by the vertical plane filtering
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_vertical_;
+    // Determined to be nonground because not enough points in bin
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_minimum_;
+    // Determined to be nonground for being outside the ground plane threshold
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_threshold_;
+    // Determined to be nonground for not being upright
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_upright_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_heading_;
+    // Final output clouds - ground & nonground points
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_ground_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_non_ground_;
+
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_cloud_;
-    pcl::PointCloud<PointT> revert_pc_, reject_pc_, noise_pc_, vertical_pc_;
+    pcl::PointCloud<PointT> revert_pc_, reject_pc_, noise_pc_, vertical_pc_, minimum_pc_, threshold_pc_, upright_pc_, heading_pc_;
     pcl::PointCloud<PointT> ground_pc_;
-    pcl::PointCloud<pcl::PointXYZINormal> normals_;
     pcl::PointCloud<PointT> regionwise_ground_, regionwise_nonground_;
 
     void initialize_zone(Zone &z, int num_sectors, int num_rings);
@@ -449,6 +466,15 @@ void PatchWorkpp<PointT>::estimate_ground(
     cloud_ground.clear();
     cloud_nonground.clear();
 
+    revert_pc_.clear();
+    reject_pc_.clear();
+    noise_pc_.clear();
+    vertical_pc_.clear();
+    minimum_pc_.clear();
+    threshold_pc_.clear();
+    upright_pc_.clear();
+    heading_pc_.clear();
+
     // 1. Reflected Noise Removal (RNR)
     if (enable_RNR_) reflected_noise_removal(cloud_in, cloud_nonground);
 
@@ -476,6 +502,7 @@ void PatchWorkpp<PointT>::estimate_ground(
 
                 if (zone[ring_idx][sector_idx].points.size() < num_min_pts_)
                 {
+                    minimum_pc_ += zone[ring_idx][sector_idx];
                     cloud_nonground += zone[ring_idx][sector_idx];
                     continue;
                 }
@@ -541,6 +568,7 @@ void PatchWorkpp<PointT>::estimate_ground(
                 // Ground estimation based on conditions
                 if (!is_upright)
                 {
+                    upright_pc_ += regionwise_ground_;
                     cloud_nonground += regionwise_ground_;
                 }
                 else if (!is_near_zone)
@@ -549,6 +577,7 @@ void PatchWorkpp<PointT>::estimate_ground(
                 }
                 else if (!is_heading_outside)
                 {
+                    heading_pc_ += regionwise_ground_;
                     cloud_nonground += regionwise_ground_;
                 }
                 else if (is_not_elevated || is_flat)
@@ -602,41 +631,6 @@ void PatchWorkpp<PointT>::estimate_ground(
 
     end = rclcpp::Clock{RCL_STEADY_TIME}.now().seconds();
     time_taken = end - start;
-
-    if (visualize_)
-    {
-        sensor_msgs::msg::PointCloud2 cloud_ROS;
-        pcl::toROSMsg(revert_pc_, cloud_ROS);
-        cloud_ROS.header.stamp = rclcpp::Clock{RCL_STEADY_TIME}.now();
-        cloud_ROS.header.frame_id = cloud_in.header.frame_id;
-        pub_revert_pc_->publish(cloud_ROS);
-
-        pcl::toROSMsg(reject_pc_, cloud_ROS);
-        cloud_ROS.header.stamp = rclcpp::Clock{RCL_STEADY_TIME}.now();
-        cloud_ROS.header.frame_id = cloud_in.header.frame_id;
-        pub_reject_pc_->publish(cloud_ROS);
-
-        pcl::toROSMsg(normals_, cloud_ROS);
-        cloud_ROS.header.stamp = rclcpp::Clock{RCL_STEADY_TIME}.now();
-        cloud_ROS.header.frame_id = cloud_in.header.frame_id;
-        pub_normal_->publish(cloud_ROS);
-
-        pcl::toROSMsg(noise_pc_, cloud_ROS);
-        cloud_ROS.header.stamp = rclcpp::Clock{RCL_STEADY_TIME}.now();
-        cloud_ROS.header.frame_id = cloud_in.header.frame_id;
-        pub_noise_->publish(cloud_ROS);
-
-        pcl::toROSMsg(vertical_pc_, cloud_ROS);
-        cloud_ROS.header.stamp = rclcpp::Clock{RCL_STEADY_TIME}.now();
-        cloud_ROS.header.frame_id = cloud_in.header.frame_id;
-        pub_vertical_->publish(cloud_ROS);
-    }
-
-    revert_pc_.clear();
-    reject_pc_.clear();
-    normals_.clear();
-    noise_pc_.clear();
-    vertical_pc_.clear();
 }
 
 template<typename PointT> inline
@@ -845,6 +839,7 @@ void PatchWorkpp<PointT>::extract_piecewiseground(
                     dst.points.push_back(src_wo_verticals[r]);
                 } else {
                     non_ground_dst.points.push_back(src_wo_verticals[r]);
+                    threshold_pc_.points.push_back(src_wo_verticals[r]);
                 }
             }
         }
@@ -911,6 +906,50 @@ void PatchWorkpp<PointT>::callbackCloud(const sensor_msgs::msg::PointCloud2::Con
 
     RCLCPP_INFO_STREAM(rclcpp::get_logger("patchworkpp"), "\033[1;32m" << "Input PointCloud: " << pc_curr.size() << " -> Ground: " << pc_ground.size() <<  "/ NonGround: " << pc_non_ground.size()
          << " (running_time: " << time_taken << " sec)" << "\033[0m");
+
+    if (visualize_)
+    {
+        sensor_msgs::msg::PointCloud2 cloud_ROS;
+        pcl::toROSMsg(revert_pc_, cloud_ROS);
+        cloud_ROS.header.stamp = cloud_msg->header.stamp;
+        cloud_ROS.header.frame_id = cloud_msg->header.frame_id;
+        pub_revert_pc_->publish(cloud_ROS);
+
+        pcl::toROSMsg(reject_pc_, cloud_ROS);
+        cloud_ROS.header.stamp = cloud_msg->header.stamp;
+        cloud_ROS.header.frame_id = output_frame;
+        pub_reject_pc_->publish(cloud_ROS);
+
+        pcl::toROSMsg(noise_pc_, cloud_ROS);
+        cloud_ROS.header.stamp = cloud_msg->header.stamp;
+        cloud_ROS.header.frame_id = output_frame;
+        pub_noise_->publish(cloud_ROS);
+
+        pcl::toROSMsg(vertical_pc_, cloud_ROS);
+        cloud_ROS.header.stamp = cloud_msg->header.stamp;
+        cloud_ROS.header.frame_id = output_frame;
+        pub_vertical_->publish(cloud_ROS);
+
+        pcl::toROSMsg(minimum_pc_, cloud_ROS);
+        cloud_ROS.header.stamp = cloud_msg->header.stamp;
+        cloud_ROS.header.frame_id = output_frame;
+        pub_minimum_->publish(cloud_ROS);
+
+        pcl::toROSMsg(threshold_pc_, cloud_ROS);
+        cloud_ROS.header.stamp = cloud_msg->header.stamp;
+        cloud_ROS.header.frame_id = output_frame;
+        pub_threshold_->publish(cloud_ROS);
+
+        pcl::toROSMsg(upright_pc_, cloud_ROS);
+        cloud_ROS.header.stamp = cloud_msg->header.stamp;
+        cloud_ROS.header.frame_id = output_frame;
+        pub_upright_->publish(cloud_ROS);
+
+        pcl::toROSMsg(heading_pc_, cloud_ROS);
+        cloud_ROS.header.stamp = cloud_msg->header.stamp;
+        cloud_ROS.header.frame_id = output_frame;
+        pub_heading_->publish(cloud_ROS);
+    }
 
     pub_ground_->publish(cloud2msg(pc_ground, cloud_msg->header.stamp, output_frame));
     pub_non_ground_->publish(cloud2msg(pc_non_ground, cloud_msg->header.stamp, output_frame));
