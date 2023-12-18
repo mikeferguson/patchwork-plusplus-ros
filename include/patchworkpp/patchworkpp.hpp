@@ -39,7 +39,7 @@ using Eigen::VectorXf;
 using namespace std;
 
 /*
-    @brief PathWork ROS Node.
+    @brief PatchWork ROS Node.
 */
 template <typename PointT>
 bool point_z_cmp(PointT a, PointT b) { return a.z < b.z; }
@@ -97,8 +97,8 @@ public:
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Num of min. points: %d", num_min_pts_);
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Seeds Threshold: %f", th_seeds_);
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Distance Threshold: %f", th_dist_);
-        RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Max. range:: %f", max_range_);
-        RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Min. range:: %f", min_range_);
+        RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Max. range: %f", max_range_);
+        RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Min. range: %f", min_range_);
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Normal vector threshold: %f", uprightness_thr_);
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "adaptive_seed_selection_margin: %f", adaptive_seed_selection_margin_);
 
@@ -112,14 +112,10 @@ public:
 
         // CZM denotes 'Concentric Zone Model'. Please refer to our paper
         num_zones_ = 4;
-        num_sectors_each_zone_ = std::vector<long>{8, 8, 8, 8};
-        new_num_sectors_each_zone_   = std::vector<long>{8, 8, 8, 8}; 
-        num_rings_each_zone_   = std::vector<long>{8, 8, 8, 8};
-        new_num_rings_each_zone_   = std::vector<long>{8, 8, 8, 8};
+        num_sectors_each_zone_ = std::vector<long>{16, 24, 32, 16};
+        num_rings_each_zone_   = std::vector<long>{2, 2, 4, 2};
         elevation_thr_ = std::vector<double>{0.0, 0.0, 0.0, 0.0};
-        new_elevation_thr_ = std::vector<double>{0.0, 0.0, 0.0, 0.0};
         flatness_thr_  = std::vector<double>{0.0, 0.0, 0.0, 0.0};
-        new_flatness_thr_  = std::vector<double>{0.0, 0.0, 0.0, 0.0};
 
         RCLCPP_INFO(rclcpp::get_logger("patchworkpp"), "Num. zones: %d", num_zones_);
 
@@ -227,10 +223,6 @@ private:
 
     // For visualization
     bool visualize_ = true;
-    vector<long> new_num_sectors_each_zone_;
-    vector<long> new_num_rings_each_zone_;
-    vector<double> new_flatness_thr_;
-    vector<double> new_elevation_thr_;
     vector<long> num_sectors_each_zone_;
     vector<long> num_rings_each_zone_;
     vector<double> sector_sizes_;
@@ -960,7 +952,7 @@ void PatchWorkpp<PointT>::pc2czm(const pcl::PointCloud<PointT> &src, std::vector
 
             czm[zone_idx][ring_idx][sector_idx].points.emplace_back(pt);
         }
-        else {
+        else if (r > max_range_) {
             cloud_nonground.push_back(pt);
         }
     }
